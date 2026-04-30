@@ -56,17 +56,22 @@
 
 ## Workflow
 
+> **Update 2026-04-30:** изначальный план «long-lived `develop` ↔ `main`» отменён. После squash-merge PR #1 ветка `develop` стала бессмысленной (force-reset блокируется хуками), переходим на **trunk-based with feature branches**:
+
 ```
-1. git checkout develop
-2. правки
-3. git commit
-4. git push origin develop
-5. gh pr create --base main --head develop
+1. git checkout main && git pull
+2. git checkout -b feat/<тема>
+3. правки + коммиты
+4. git push origin feat/<тема>
+5. gh pr create --base main --head feat/<тема>
 6. (CI отработает на PR)
-7. self-merge через gh pr merge --squash
+7. self-merge через gh pr merge --squash --delete-branch
+8. git checkout main && git pull
 ```
 
 При появлении CI с реальными статусами — добавить `required_status_checks` в ruleset, тогда merge заблокируется до зелёного билда.
+
+Ветка `develop` остаётся в репо как «buffer» / возможный staging-pointer, но активно не используется.
 
 ## Последствия
 

@@ -18,3 +18,6 @@
 | 0003 | [Server GC with hard heap limit](0003-server-gc-with-heap-limit.md) | Accepted | 2026-04-30 |
 | 0004 | [API versioning policy: /api/v1/](0004-api-versioning-v1-prefix.md) | Accepted | 2026-04-30 |
 | 0005 | [Branch protection model](0005-branch-protection-model.md) | Accepted | 2026-04-30 |
+| 0006 | [Observability stack](0006-observability-stack.md) | Accepted | 2026-04-30 |
+| 0007 | [Brigading detection — sliding 7-day window](0007-brigading-detection.md) | Accepted | 2026-04-30 |
+| 0008 | [Consensus override thresholds for high-impact attributes](0008-consensus-override-thresholds.md) | Accepted | 2026-04-30 |
