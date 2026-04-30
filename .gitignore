@@ -1,0 +1,46 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Env / secrets
+.env
+*.env
+*.env.local
+appsettings.*.local.json
+appsettings.Development.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code session artifacts
+.claude/handoffs/
+.claude/memory/
+
+# Logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+.next/
+
+# DB
+*.db
+*.db-journal
