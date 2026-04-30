@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-docs:
+    name: Lint docs and structure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify required files exist
+        run: |
+          test -f README.md
+          test -f .gitignore
+          test -f docs/tech/georgia_places_tz.md
+          test -d docs/tech/adr
+
+      - name: Check no secrets committed
+        run: |
+          # Simple grep for obvious secret patterns. Will be replaced by gitleaks once stack is in place.
+          ! grep -rE "(AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\\-_]{35}|gh[ps]_[A-Za-z0-9]{36,})" \
+            --include="*.cs" --include="*.py" --include="*.json" --include="*.yml" \
+            --exclude-dir=node_modules --exclude-dir=.git . || \
+            { echo "Possible secret detected"; exit 1; }
+
+  # Backend, parser, frontend jobs will be added as code lands.
+  # Each must pass before PR can merge into main (will be wired into branch ruleset).

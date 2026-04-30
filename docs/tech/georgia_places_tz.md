@@ -97,7 +97,7 @@
 - Entity Framework Core 9 (для миграций) + Dapper (для read-запросов)
 - PostgreSQL 16 + PostGIS 3.4
 - Сервинг через Kestrel за Nginx
-- **Workstation GC** (не Server GC) для экономии памяти
+- **Server GC + конкурентный + `DOTNET_GCHeapHardLimit=200000000`** (см. [ADR-0003](adr/0003-server-gc-with-heap-limit.md)) — предсказуемая latency на throughput-сервисе, жёсткий ceiling вместо OOM-kill
 - **Trimmed publish** без Native AOT (AOT часто конфликтует с EF Core рефлексией)
 
 **Frontend:**
@@ -124,7 +124,7 @@
 |-----------|-------|-------------|
 | Ubuntu система | ~150 MB | базовый minimal |
 | Postgres | ~250 MB | `shared_buffers=128MB`, `max_connections=20` |
-| .NET API | ~200 MB | Workstation GC, не Server GC |
+| .NET API | ~200 MB | Server GC + concurrent + `GCHeapHardLimit=200MB` (ADR-0003); `mem_limit: 230m` в compose (запас на native + thread stacks) |
 | Nginx | ~20 MB | alpine |
 | Кэш ОС / запас | ~380 MB | |
 | **Парсер** | ~300 MB | **запускается только когда API спит (03:00-06:00)** |
@@ -216,17 +216,24 @@ CREATE TABLE places (
     
     -- статистика
     reports_count INT DEFAULT 0,
-    
+
+    -- DMCA / ручное скрытие (см. §19.16)
+    hidden BOOLEAN NOT NULL DEFAULT false,
+    hidden_reason TEXT,
+    hidden_at TIMESTAMPTZ,
+
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE INDEX idx_places_geom ON places USING GIST (geom);
-CREATE INDEX idx_places_attributes ON places USING GIN (attributes);
-CREATE INDEX idx_places_category ON places (category);
+CREATE INDEX idx_places_geom ON places USING GIST (geom) WHERE hidden = false;
+CREATE INDEX idx_places_attributes ON places USING GIN (attributes) WHERE hidden = false;
+CREATE INDEX idx_places_category ON places (category) WHERE hidden = false;
 CREATE INDEX idx_places_google_id ON places (google_place_id) WHERE google_place_id IS NOT NULL;
 CREATE INDEX idx_places_osm_id ON places (osm_id, osm_type) WHERE osm_id IS NOT NULL;
 ```
+
+> Все API read-запросы добавляют `WHERE hidden = false` (одна строка в DAL). Partial-индексы исключают скрытые места из spatial и фильтр-запросов — никакого падения performance после DMCA.
 
 ### 4.2. Таблица `attributes_dictionary` — словарь атрибутов
 
@@ -604,31 +611,60 @@ CREATE TABLE api_budget_counters (
 );
 ```
 
-Перед каждым вызовом Gemini:
+Перед каждым вызовом Gemini — **атомарная** операция check+increment:
 
 ```python
-def can_call_gemini(category: str) -> bool:
+def try_reserve_gemini(category: str) -> bool:
+    """
+    Атомарно резервирует один вызов Gemini для категории.
+    Возвращает True если вызов разрешён, False — если лимит исчерпан.
+    Никаких race conditions: при параллельных воркерах суммарный counter
+    не превысит лимит даже на 1.
+    """
     today = date.today()
-    
-    # Глобальный лимит
-    total = get_counter("gemini_total", today)
-    if total >= DAILY_BUDGETS["gemini_total_rpd"]:
-        return False
-    
-    # Категорийный мягкий лимит — после превышения работает только высокий приоритет
-    cat_used = get_counter(f"gemini_{category}", today)
     cat_budget = DAILY_BUDGETS[f"gemini_{category}"]
-    
-    if cat_used >= cat_budget:
-        # категория исчерпана — пропускаем только UGC (он критичный для UX)
-        return category == "ugc_classification"
-    
-    return True
+    total_budget = DAILY_BUDGETS["gemini_total_rpd"]
+    is_critical = category == "ugc_classification"
 
-def increment_gemini(category: str):
-    increment_counter("gemini_total", date.today())
-    increment_counter(f"gemini_{category}", date.today())
+    with db.transaction():
+        # Один UPDATE проверяет оба лимита и увеличивает оба счётчика, либо ничего
+        result = db.execute("""
+            WITH global_check AS (
+                UPDATE api_budget_counters
+                SET counter = counter + 1, updated_at = now()
+                WHERE api_name = 'gemini_total' AND date = %s
+                  AND counter < %s
+                RETURNING counter
+            ),
+            category_check AS (
+                UPDATE api_budget_counters
+                SET counter = counter + 1, updated_at = now()
+                WHERE api_name = %s AND date = %s
+                  AND (counter < %s OR %s)
+                  AND EXISTS (SELECT 1 FROM global_check)
+                RETURNING counter
+            )
+            SELECT
+                (SELECT counter FROM global_check) AS gtotal,
+                (SELECT counter FROM category_check) AS gcat
+        """, (today, total_budget,
+              f"gemini_{category}", today, cat_budget, is_critical))
+
+        row = result.fetchone()
+        if row is None or row.gtotal is None:
+            return False  # глобальный лимит достигнут
+        if row.gcat is None and not is_critical:
+            # глобальный увеличили, категорийный нет — откатим глобальный
+            db.execute("""
+                UPDATE api_budget_counters
+                SET counter = counter - 1
+                WHERE api_name = 'gemini_total' AND date = %s
+            """, (today,))
+            return False
+        return True
 ```
+
+> **Почему так:** прежняя версия (`get_counter` + `if` + `increment_counter`) имела race condition — два параллельных воркера (hourly + daily при overlap) могли пройти проверку одновременно и суммарно превысить лимит. Закрыто P0 из REVIEW-BACKLOG.
 
 При исчерпании лимита: задача попадает в `processing_queue` с `next_retry_at = tomorrow 00:01 UTC`. Не теряется, обработается завтра.
 
@@ -1033,6 +1069,31 @@ Body: { "vote": 1 | -1 | 0 }
 
 Все endpoints публичные, без аутентификации. Cloudflare кэширует с разными TTL.
 
+### 8.0. Общие правила (versioning, error format, idempotency)
+
+**Версионирование URL.** Все endpoints живут под префиксом `/api/v1/...` (см. [ADR-0004](adr/0004-api-versioning-v1-prefix.md)). В примерах ниже префикс может быть опущен ради краткости — реальные URL содержат `/api/v1/`. При выпуске v2 версия v1 сохраняется минимум 12 месяцев с header `Deprecation: true` + `Sunset: <RFC 9745 date>`.
+
+**Формат ошибок.** Все 4xx/5xx ответы используют RFC 7807 ProblemDetails:
+
+```json
+{
+  "type": "https://georgia-places.example/problems/rate-limit",
+  "title": "Rate Limit Exceeded",
+  "status": 429,
+  "detail": "Превышен лимит 10 отчётов в час с одного IP.",
+  "instance": "/api/v1/places/123/reports",
+  "retryAfter": 3600
+}
+```
+
+В .NET — `app.UseExceptionHandler()` + `IProblemDetailsService` + `Microsoft.AspNetCore.Http.HttpValidationProblemDetails` для 400.
+
+**Idempotency-Key.** Все мутирующие POST endpoints (UGC submit, dispute, vote, click) принимают опциональный header `Idempotency-Key: <uuid>`. Сервер хранит `(idempotency_key, response_hash, created_at)` 24 часа. При повторе с тем же ключом — возврат сохранённого ответа без побочного эффекта. Без ключа — обычная обработка.
+
+**Курсорная пагинация.** Все list-endpoints используют `?cursor=<opaque>&limit=<int>` вместо `offset`. Max `limit=100`. Response содержит `nextCursor: <string|null>` и `hasMore: bool`. Поле `total` не возвращается (COUNT(*) под нагрузкой дорогой), либо возвращается опционально по `?include=total`.
+
+**Status codes.** Каждый endpoint в этом разделе перечисляет все возможные коды. Стандартный набор: `200` OK для GET, `201 Created` + `Location` для POST, `400` validation, `404` not found, `409` conflict (idempotency mismatch), `429` rate limit, `503` graceful degradation (внешний сервис недоступен).
+
 ### 8.1. `GET /api/places`
 
 Список мест с фильтрацией.
@@ -1225,21 +1286,20 @@ Response:
 Юзер на фронте кликает 2-5 точек на карте (от A до B плюс желаемые промежуточные waypoints) → клиент строит **прямую ломаную** между ними → POST в API → PostGIS считает буфер вокруг ломаной → возвращает POI в этом буфере.
 
 ```
-POST /api/route/places
-Body:
-{
-  "waypoints": [
-    {"lat": 41.7, "lng": 44.8},   # Тбилиси
-    {"lat": 42.0, "lng": 43.0},   # промежуточная
-    {"lat": 41.6, "lng": 41.6}    # Батуми
-  ],
-  "buffer_km": 5,
-  "categories": ["viewpoint", "monastery", "waterfall"],
-  "attrs": "free:true"
-}
+GET /api/v1/route/places
+Query:
+  waypoints=41.7,44.8;42.0,43.0;41.6,41.6   # ;-separated lat,lng pairs
+  buffer_km=5
+  categories=viewpoint,monastery,waterfall
+  attrs=free:true
+  cursor=<opaque>
+  limit=100
 
 Cache-Control: public, max-age=600
+ETag: "<hash(query)>"
 ```
+
+> Метод изменён с `POST` на `GET`: это read-операция, Cloudflare CDN кэширует только GET по умолчанию (см. ADR-0004 и REVIEW-BACKLOG P1 api-design).
 
 Внутри:
 
@@ -1453,17 +1513,49 @@ sudo sysctl vm.swappiness=10
 
 ### 10.5. Бэкап БД
 
+**RPO = 24 часа, RTO ≈ 30 минут.** Это осознанное решение — см. [ADR-0002](adr/0002-rpo-24h-no-wal-archiving.md). Используется ежедневный `pg_dump`, без WAL archiving.
+
 ```bash
 #!/bin/bash
 # /opt/scripts/backup.sh
+set -euo pipefail
 DATE=$(date +%Y-%m-%d)
-docker compose exec -T postgres pg_dump -U postgres mydb | gzip > /tmp/db-$DATE.sql.gz
-rclone copy /tmp/db-$DATE.sql.gz r2:db-backups/
-rm /tmp/db-$DATE.sql.gz
-curl -fsS https://hc-ping.com/<UUID>  # healthcheck
+DUMP=/tmp/db-${DATE}.dump
+
+# --format=custom: восстановление через pg_restore с параллелизмом, метаданные включены
+docker compose exec -T -e PGPASSWORD="${DB_PASSWORD}" postgres \
+    pg_dump -U "${DB_USER}" -d "${DB_NAME}" --format=custom --compress=9 -f /tmp/dump.bin
+docker compose cp postgres:/tmp/dump.bin "${DUMP}"
+
+rclone copy "${DUMP}" r2:db-backups/
+rm "${DUMP}"
+curl -fsS "https://hc-ping.com/${HEALTHCHECKS_BACKUP_UUID}"  # healthcheck
 ```
 
 R2 lifecycle удаляет бэкапы старше 30 дней автоматически.
+
+**Restore-runbook** (`/opt/scripts/restore.sh`):
+
+```bash
+#!/bin/bash
+set -euo pipefail
+DATE="${1:?usage: restore.sh YYYY-MM-DD}"
+DUMP=/tmp/restore-${DATE}.dump
+
+rclone copy "r2:db-backups/db-${DATE}.dump" "${DUMP}"
+
+docker compose exec -T -e PGPASSWORD="${DB_PASSWORD}" postgres psql -U "${DB_USER}" \
+    -c "DROP DATABASE IF EXISTS ${DB_NAME}_restore;" \
+    -c "CREATE DATABASE ${DB_NAME}_restore;" \
+    -c "\\c ${DB_NAME}_restore" \
+    -c "CREATE EXTENSION IF NOT EXISTS postgis;"
+
+docker compose cp "${DUMP}" postgres:/tmp/restore.dump
+docker compose exec -T -e PGPASSWORD="${DB_PASSWORD}" postgres \
+    pg_restore -U "${DB_USER}" -d "${DB_NAME}_restore" --jobs=2 /tmp/restore.dump
+```
+
+**Verify-restore** (`/opt/scripts/verify-restore.sh`, cron раз в 30 дней): берёт **последний** бэкап, восстанавливает в `${DB_NAME}_verify`, проверяет `SELECT count(*) FROM places > 0` и `SELECT count(*) FROM place_signals > 0`, дропает базу. Пингует Healthchecks. Закрывает P0 из ревью «backup без restore-протокола».
 
 ### 10.6. Мониторинг
 
@@ -1599,10 +1691,11 @@ R2 lifecycle удаляет бэкапы старше 30 дней автомат
 
 ### Этап 5 — Маршруты A→B (1 неделя)
 
-- API `GET /api/route/places`
-- OSRM публичный для построения маршрута
-- PostGIS буфер вокруг маршрута
-- UI выбора A→B на карте
+- API `GET /api/v1/route/places`
+- **Никакого OSRM** — см. §1.5 и §8.5: настоящий routing не используется. Юзер кликает waypoints на карте, фронт строит ломаную, бэк считает PostGIS-буфер вокруг ломаной.
+- PostGIS `ST_DWithin` + `ST_MakeLine` буфер вокруг ломаной
+- UI выбора 2-5 точек на карте
+- На UI явный disclaimer: «это не настоящий маршрут — для навигации используйте Yandex/Google Maps по deeplink»
 
 **Результат:** «еду из Тбилиси в Батуми, покажи интересные места по пути».
 
