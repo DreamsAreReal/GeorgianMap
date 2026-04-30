@@ -287,10 +287,10 @@ CREATE TABLE place_signals (
     source_id TEXT,             -- внутренний ID источника
     weight REAL NOT NULL,       -- начальный вес сигнала (см. 5.1)
     
-    -- для UGC: технические идентификаторы (без персданных)
-    ip_hash TEXT,
-    fingerprint_hash TEXT,
-    subnet_hash TEXT,           -- /24 от IP, для anti-burst
+    -- для UGC: технические идентификаторы (без персданных, см. ADR-0007 §5.3.3)
+    -- ip_hash удалён — сырой IP не хранится вообще
+    fingerprint_hash TEXT,                              -- браузерный fingerprint
+    subnet_hash TEXT,                                   -- SHA256(salt || /24-subnet); соль ротируется раз в 90 дней
     
     -- агрегация
     excluded_from_consensus BOOLEAN DEFAULT false,  -- помечается при детекции аномалий
@@ -423,12 +423,26 @@ CREATE INDEX idx_parser_runs_job ON parser_runs (job_name, started_at DESC);
 - Если значение от Tier-2 или Tier-3 — Tier-1 **перебивает** (с обновлением `attribute_sources`).
 - Если значение конфликтует между двумя Tier-1 (Google говорит «работает», Wikidata устарела) — оставляем тот у которого `weight × freshness_factor` выше.
 
-#### 5.2.2. Tier 2 — Telegram / YouTube парсинг (применяется при confidence ≥ 0.7)
+#### 5.2.2. Tier 2 — Telegram / YouTube парсинг (per-impact thresholds)
 
-Сигнал от LLM-извлечения с `confidence >= 0.7` применяется по **одному**, без consensus, но:
+Полные правила в [ADR-0008](adr/0008-consensus-override-thresholds.md). Применение Tier-2 сигнала зависит от **impact level** атрибута:
+
+| Impact | Атрибуты | Min agreeing signals | Min confidence |
+|--------|----------|----------------------|----------------|
+| **Critical** | `price_gel`, `entrance_fee`, `is_open`, `is_closed_permanently` | 3 | 0.8 |
+| **High** | `dogs`, `road`, `wheelchair_accessible`, `kids_allowed` | 2 | 0.75 |
+| **Medium** | `parking`, `wifi`, `family_friendly`, `viewpoint_360`, `bathrooms` | 1 | 0.7 |
+| **Low** | `instagram_friendly`, `quiet`, `crowded`, `aesthetic_score` | 1 | 0.6 |
+
+Дополнительные правила:
 
 - Не перебивает Tier-1.
-- Если в `places.attributes` уже есть значение от Tier-2 — применяется только если новый сигнал свежее на ≥7 дней или confidence выше на ≥0.15.
+- Если в `places.attributes` уже есть значение от Tier-2 — применяется только если новый сигнал свежее на ≥7 дней **или** confidence выше на ≥0.15 (с учётом порогов выше).
+- **Single-signal apply** для Medium/Low помечается `provisional = true` в `attribute_sources`. Через 7 дней без подтверждения — сбрасывается обратно в `null`.
+- Сигналы старше 90 дней не считаются для Critical/High уровней.
+- «Agreeing» = одинаковое значение для bool/enum, ±10% для range_int/range_float.
+
+> **Почему так:** прежнее правило (single Tier-2 ≥ 0.7 → apply) уязвимо к иронии и опечаткам в источниках. Иронический пост в туристическом канале с 15K подписчиков давал `free=true` как факт. Закрывает P0 из REVIEW-BACKLOG.
 
 #### 5.2.3. Tier 3 — UGC (применяется только при consensus)
 
@@ -468,34 +482,53 @@ UGC_CONSENSUS_THRESHOLDS = {
 
 ### 5.3. Detection аномалий (анти-абуз)
 
-Все сигналы за последние 24 часа по одному (place_id, attribute) проверяются:
+Полные правила в [ADR-0007](adr/0007-brigading-detection.md). Два временных окна: **24 часа** (быстрые атаки) и **7 дней** (slow brigading).
+
+#### 5.3.1. 24-часовые паттерны (быстрые атаки)
 
 ```python
-def detect_anomaly(signals_24h):
-    if len(signals_24h) > 10:
+def detect_anomaly_24h(signals):
+    if len(signals) > 10:
         return "burst_attack"
-    
-    subnets = Counter(s.subnet_hash for s in signals_24h)
-    if signals_24h and max(subnets.values()) / len(signals_24h) > 0.8:
+
+    subnets = Counter(s.subnet_hash for s in signals)
+    if signals and max(subnets.values()) / len(signals) > 0.8:
         return "single_source"
-    
-    fingerprints = Counter(s.fingerprint_hash for s in signals_24h)
-    if signals_24h and max(fingerprints.values()) / len(signals_24h) > 0.5:
+
+    fingerprints = Counter(s.fingerprint_hash for s in signals)
+    if signals and max(fingerprints.values()) / len(signals) > 0.5:
         return "single_device"
-    
-    if check_text_similarity_via_llm(signals_24h) > 0.7:
+
+    if check_text_similarity_via_llm(signals) > 0.7:
         return "copypaste"
-    
-    if len(signals_24h) >= 5:
-        values = [s.attribute_value for s in signals_24h]
+
+    if len(signals) >= 5:
+        values = [s.attribute_value for s in signals]
         if len(set(json.dumps(v) for v in values)) == 1 and \
-           all(s.source_type == 'user_report' for s in signals_24h):
+           all(s.source_type == 'user_report' for s in signals):
             return "coordinated_unanimous"
-    
+
     return None
 ```
 
+#### 5.3.2. 7-дневные паттерны (slow brigading)
+
+Закрывают P0: атака 4 сигнала/день × 5 дней не триггерит ни один из 24-часовых порогов. Запускаются hourly job-ом `anomaly_detect`.
+
+**Паттерн `slow_brigading_subnet_7d`** — ≥4 сигналов с одной /24 subnet за 7 дней на одно (place_id, attribute_key). Сигналы помечаются `excluded_from_consensus = true`.
+
+**Паттерн `slow_brigading_fingerprint_7d`** — ≥3 сигналов с одинаковым fingerprint_hash за 7 дней.
+
+**Паттерн `coordinated_value_flip`** — ≥5 сигналов на одно (place_id, attribute_key, attribute_value), все меняют значение на одно и то же, ≥3 разных subnet, при этом ≥75% сигналов в пределах ±6 часов от медианного времени. Идут в **LLM-арбитраж** (Gemini оценивает органичность). Решение Gemini сохраняется.
+
 При срабатывании любого паттерна — все сигналы периода помечаются `excluded_from_consensus = true` с указанием reason. Они **не удаляются**, но не участвуют в агрегации.
+
+#### 5.3.3. IP-адреса и анонимность
+
+ТЗ §1.2 требует «без персональных данных». IP — PII в EU. Решение:
+- Храним **не сам IP, а соленый хэш subnet /24**: `subnet_hash = SHA256(salt || subnet_24)`.
+- Соль ротируется раз в 90 дней (через cron) — старые хэши становятся бесполезны для re-identification.
+- Сырой IP не пишется в БД, только в logs с маской последнего октета (`1.2.3.0/24`), retention логов — 14 дней.
 
 ### 5.4. Time-decay при пересчёте
 
@@ -1557,17 +1590,36 @@ docker compose exec -T -e PGPASSWORD="${DB_PASSWORD}" postgres \
 
 **Verify-restore** (`/opt/scripts/verify-restore.sh`, cron раз в 30 дней): берёт **последний** бэкап, восстанавливает в `${DB_NAME}_verify`, проверяет `SELECT count(*) FROM places > 0` и `SELECT count(*) FROM place_signals > 0`, дропает базу. Пингует Healthchecks. Закрывает P0 из ревью «backup без restore-протокола».
 
-### 10.6. Мониторинг
+### 10.6. Observability stack
 
-Бесплатные сервисы:
+Полный стек описан в [ADR-0006](adr/0006-observability-stack.md). Краткая сводка:
 
-| Сервис | Что мониторит |
-|--------|---------------|
-| Healthchecks.io | Cron-jobs (парсер, бэкап) — алерт если не пинговался |
-| UptimeRobot | HTTP(S) пинг `/health` каждые 5 минут |
-| Cloudflare Analytics | Трафик, status codes, кэш-хиты |
+| Слой | Сервис | Free tier | RAM на VPS |
+|------|--------|-----------|------------|
+| Logs (structured) | **Grafana Cloud Loki** | 50 GB/мес, 14 дней | 0 (push через OTLP) |
+| Metrics | **Grafana Cloud Prometheus** | 10K series, 14 дней | 0 |
+| Traces | **Grafana Cloud Tempo** | 50 GB/мес, 14 дней | 0 |
+| Errors | **Sentry Free** | 5K errors + 50K perf events/мес, 30 дней | 0 (HTTP) |
+| Cron pings | Healthchecks.io | 20 чеков | 0 |
+| Synthetic | UptimeRobot | 50 мониторов, 5-мин | 0 |
 
-Алерты только при критических проблемах, на email раз в сутки максимум.
+**Транспорт:** OpenTelemetry SDK → OTLP HTTP push (никаких агентов на VPS).
+
+**.NET:** `Serilog` + `Serilog.Sinks.OpenTelemetry`, `OpenTelemetry.Extensions.Hosting`, `Sentry.AspNetCore`.
+
+**Python parser:** `structlog`, `opentelemetry-sdk`, `sentry-sdk`.
+
+**Correlation ID:** ASP.NET middleware пробрасывает `X-Correlation-Id` (либо генерирует), Serilog enriches all logs. Python parser генерирует UUID на старте каждого job-run, кладёт в `structlog.contextvars`.
+
+**Алерты P0 (через Grafana Cloud Alerting → email + Telegram webhook):**
+1. `up{job="api"} == 0 for 2m` — API down
+2. `histogram_quantile(0.95, http_request_duration_seconds) > 0.5 for 5m` — p95 деградация
+3. `rate(http_requests_total{status=~"5.."}[5m]) > 0.05` — 5xx > 5%
+4. `gemini_low_confidence_discarded_total / gemini_calls_total > 0.4 for 1h` — Gemini тихо деградирует
+5. `time() - max(parser_last_success_timestamp) > 90000` — парсер не успешен >25h
+6. `processing_queue_size{status="failed"} > 100` — очередь failed копится
+
+**Last-resort fallback:** при отказе Grafana Cloud — файловые логи на VPS (Serilog файловый sink с logrotate) остаются как backup. OTel endpoint меняется в env, ноль изменений в коде.
 
 ---
 
@@ -1603,10 +1655,96 @@ docker compose exec -T -e PGPASSWORD="${DB_PASSWORD}" postgres \
 
 ### 12.2. Оптимизации БД
 
-- Индексы: GIN на `places.attributes`, GIST на `places.geom`, btree на `category`, `osm_id`, `google_place_id`
-- Materialized view `places_summary` для главной выдачи (обновляется раз в час)
-- Connection pool: 10 в EF Core, 5 в Dapper
+- Индексы: GIN на `places.attributes`, GIST на `places.geom`, btree на `category`, `osm_id`, `google_place_id` (все partial — `WHERE hidden = false`, см. §4.1)
+- **Materialized view `places_summary`** — горячая выдача карты, обновляется раз в час с `REFRESH ... CONCURRENTLY` (не блокирует читателей)
+- Connection pool: 10 в EF Core, 5 в Dapper (см. REVIEW-BACKLOG: при росте до production вынести в PgBouncer transaction mode)
 - Подготовленные запросы для частых паттернов фильтрации
+
+#### Materialized view DDL
+
+```sql
+CREATE MATERIALIZED VIEW places_summary AS
+SELECT
+    p.id,
+    p.name,
+    p.category,
+    p.geom,
+    p.lat AS lat,           -- денормализуем координаты для быстрых JSON-ответов
+    p.lng AS lng,
+    p.google_rating,
+    p.google_reviews_count,
+    -- денормализуем горячие фильтр-атрибуты в отдельные колонки, JSONB остаётся для долгого хвоста
+    (p.attributes->>'free')::boolean AS attr_free,
+    (p.attributes->>'parking')::boolean AS attr_parking,
+    p.attributes->>'dogs' AS attr_dogs,
+    p.attributes->>'road' AS attr_road,
+    NULLIF(p.attributes->>'price_gel', '')::int AS attr_price_gel,
+    -- thumbnail из Google photos
+    p.google_photos->0 AS thumbnail,
+    p.attributes,           -- полный JSONB для остальных фильтров
+    p.last_verified_at,
+    p.data_freshness_score
+FROM places p
+WHERE p.hidden = false;
+
+-- УНИКАЛЬНЫЙ индекс ОБЯЗАТЕЛЕН для REFRESH CONCURRENTLY
+CREATE UNIQUE INDEX idx_places_summary_id ON places_summary (id);
+
+-- индексы для типовых запросов
+CREATE INDEX idx_summary_geom ON places_summary USING GIST (geom);
+CREATE INDEX idx_summary_attributes ON places_summary USING GIN (attributes);
+CREATE INDEX idx_summary_category ON places_summary (category);
+CREATE INDEX idx_summary_freshness ON places_summary (data_freshness_score DESC) WHERE data_freshness_score > 0.5;
+```
+
+#### Hourly refresh
+
+Cron в 02:25, 03:25, ..., 23:25 (между парсер-job-ами):
+
+```bash
+docker compose exec -T postgres psql -U "${DB_USER}" -d "${DB_NAME}" \
+    -c "REFRESH MATERIALIZED VIEW CONCURRENTLY places_summary;"
+```
+
+**Почему CONCURRENTLY:** обычный `REFRESH MATERIALIZED VIEW` берёт `ACCESS EXCLUSIVE LOCK` на view — все читающие API-запросы блокируются на время refresh (3-10 сек при 50K мест). `CONCURRENTLY` создаёт временную копию и атомарно подменяет — читатели видят либо старые данные, либо новые, никогда не блокируются. Стоимость: ~2× места на диске на время refresh, +20% времени refresh. На 50K мест укладывается в секунды, диск с запасом.
+
+**Защита от наложения:** обёрнуть в `pg_try_advisory_lock(<hash>)` чтобы при overlap (например, ручной refresh + cron) не запустилось два параллельных refresh:
+
+```sql
+SELECT pg_try_advisory_lock(7235812);  -- константа для places_summary
+-- если returned true:
+REFRESH MATERIALIZED VIEW CONCURRENTLY places_summary;
+SELECT pg_advisory_unlock(7235812);
+```
+
+#### Stampede protection для IMemoryCache
+
+При истечении TTL `attributes_dictionary` несколько параллельных запросов пробивают кэш в Postgres одновременно. Решение — `SemaphoreSlim` lock в `GetOrCreateAsync`:
+
+```csharp
+private static readonly SemaphoreSlim _attrDictLock = new(1, 1);
+
+public async Task<Dictionary<string, AttrDef>> GetAttributesDictionaryAsync(CancellationToken ct)
+{
+    if (_cache.TryGetValue("attr_dict", out Dictionary<string, AttrDef>? cached))
+        return cached!;
+
+    await _attrDictLock.WaitAsync(ct);
+    try
+    {
+        // double-check после lock
+        if (_cache.TryGetValue("attr_dict", out cached))
+            return cached!;
+
+        var fresh = await LoadFromDbAsync(ct);
+        _cache.Set("attr_dict", fresh, TimeSpan.FromHours(1));
+        return fresh;
+    }
+    finally { _attrDictLock.Release(); }
+}
+```
+
+При 10-15 RPS на cold cache — 1 запрос идёт в БД, остальные ждут ~50ms на семафоре и читают свежий кэш.
 
 ### 12.3. Кэширование на уровне API
 
