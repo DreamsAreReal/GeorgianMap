@@ -18,6 +18,17 @@ obj/
 appsettings.*.local.json
 appsettings.Development.json
 
+# TLS certs / private keys
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+certs/
+
+# rclone (R2 backup credentials)
+rclone.conf
+
 # OS
 .DS_Store
 Thumbs.db
@@ -29,6 +40,12 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Test artifacts
+coverage/
+TestResults/
+*.trx
+*.coverage
 
 # Python
 __pycache__/
