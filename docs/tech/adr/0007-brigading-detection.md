@@ -45,7 +45,9 @@
 
 ### Новые паттерны
 
-**Паттерн 4 — `slow_brigading_subnet_7d`**
+**Паттерн 4 — `slow_brigading_subnet_7d`** (hourly job)
+
+Группировка напрямую по `subnet_hash` (сырой IP не хранится — см. §IP-адреса ниже).
 
 ```sql
 WITH subnet_signals AS (
@@ -53,12 +55,13 @@ WITH subnet_signals AS (
         place_id,
         attribute_key,
         attribute_value,
-        substring(ip_address::text from '^(\d+\.\d+\.\d+)\.') AS subnet_24,
+        subnet_hash,
         count(*) AS sig_count
     FROM place_signals
     WHERE source_type = 'ugc'
       AND created_at > now() - interval '7 days'
-      AND ip_address IS NOT NULL
+      AND subnet_hash IS NOT NULL
+      AND excluded_from_consensus = false
     GROUP BY 1, 2, 3, 4
 )
 SELECT * FROM subnet_signals WHERE sig_count >= 4;
@@ -66,53 +69,73 @@ SELECT * FROM subnet_signals WHERE sig_count >= 4;
 
 Найденные сигналы помечаются `excluded_from_consensus = true` с reason `'slow_brigading_subnet'`. Не удаляются — для аудита.
 
-**Паттерн 5 — `slow_brigading_fingerprint_7d`**
+**Требуемый индекс:** `CREATE INDEX idx_signals_subnet_window ON place_signals (subnet_hash, place_id, attribute_key) WHERE source_type = 'ugc' AND excluded_from_consensus = false;` — покрывает паттерны 4 и 5.
 
-Аналогично, но группировка по `fingerprint_hash` вместо subnet. Лимит: ≥3 сигналов на одно место с одинаковым fingerprint за 7 дней.
+**Паттерн 5 — `slow_brigading_fingerprint_7d`** (hourly job)
 
-**Паттерн 6 — `coordinated_value_flip`**
+Аналогично паттерну 4, но GROUP BY `fingerprint_hash` вместо `subnet_hash`. Лимит: ≥3 сигналов на одно место с одинаковым fingerprint за 7 дней.
 
-Если за 7 дней пришло ≥5 сигналов на одно место и одну attribute_key, и **все** они меняют значение на одно и то же (например, все говорят `is_open=false`), при этом источники географически разнесены (>3 разных subnet) — но в коротком временном окне (75% сигналов в пределах 12 часов любого момента в 7 днях) — это ≥75% probability координированной атаки.
+**Паттерн 6 — `coordinated_value_flip`** (nightly job)
+
+Вынесен из hourly в nightly: дорогой запрос (двухпроходная агрегация с window function), а LLM-арбитраж не требует часовой гранулярности — суточная задержка для арбитража приемлема.
+
+Если за 7 дней пришло ≥5 сигналов на одно (place_id, attribute_key, attribute_value), при этом источники географически разнесены (≥3 разных subnet), и ≥75% этих сигналов лежит в любом 12-часовом окне внутри 7 дней — это вероятная координированная атака.
 
 ```sql
-WITH value_flips AS (
+-- Шаг 1: для каждого сигнала находим, сколько ОДНОЗНАЧНЫХ сигналов
+-- лежит в скользящем 12-часовом окне вокруг него (без коррелированного подзапроса).
+WITH windowed AS (
+    SELECT
+        s.place_id,
+        s.attribute_key,
+        s.attribute_value,
+        s.subnet_hash,
+        s.created_at,
+        count(*) OVER (
+            PARTITION BY s.place_id, s.attribute_key, s.attribute_value
+            ORDER BY EXTRACT(EPOCH FROM s.created_at)
+            RANGE BETWEEN 21600 PRECEDING AND 21600 FOLLOWING  -- ±6 часов = 12-часовое окно
+        ) AS window_count
+    FROM place_signals s
+    WHERE s.source_type = 'ugc'
+      AND s.created_at > now() - interval '7 days'
+      AND s.excluded_from_consensus = false
+),
+flips AS (
     SELECT
         place_id,
         attribute_key,
         attribute_value,
         count(*) AS sig_count,
-        count(DISTINCT substring(ip_address::text from '^(\d+\.\d+\.\d+)\.')) AS distinct_subnets,
-        max(created_at) - min(created_at) AS span,
-        percentile_cont(0.5) WITHIN GROUP (ORDER BY created_at) AS median_time
-    FROM place_signals
-    WHERE source_type = 'ugc'
-      AND created_at > now() - interval '7 days'
+        count(DISTINCT subnet_hash) AS distinct_subnets,
+        -- максимум совпадающих сигналов в любом 12h окне
+        max(window_count) AS max_window_count
+    FROM windowed
     GROUP BY 1, 2, 3
 )
-SELECT * FROM value_flips
+SELECT *
+FROM flips
 WHERE sig_count >= 5
   AND distinct_subnets >= 3
-  AND span < interval '7 days'
-  AND (SELECT count(*) FROM place_signals s
-       WHERE s.place_id = value_flips.place_id
-         AND s.attribute_key = value_flips.attribute_key
-         AND s.attribute_value = value_flips.attribute_value
-         AND s.created_at BETWEEN median_time - interval '6 hours' AND median_time + interval '6 hours'
-      ) * 1.0 / sig_count >= 0.75;
+  AND max_window_count::float / sig_count >= 0.75;
 ```
 
-Эти сигналы **не помечаются как excluded автоматически** — они идут в очередь на **LLM-арбитраж** (Вариант D как вторичный): Gemini получает анонимизированные тексты сигналов и оценивает, выглядят ли они как органичный отзыв или как координированная кампания. Решение Gemini сохраняется.
+Сложность: O(n log n) на сортировку для window function. На 100K rows — ~500ms-1s на 1 vCPU. Приемлемо для nightly job. Существующего `idx_signals_place_attr (place_id, attribute_key, created_at DESC)` достаточно — window function может использовать его для пред-сортировки.
+
+Эти сигналы **не помечаются как excluded автоматически** — они идут в очередь на LLM-арбитраж. Если Gemini quota исчерпан — fallback по цепочке §11 ТЗ (Groq → Ollama → отложить). Если арбитражного ответа нет в течение 48 часов — conservative fallback: помечаются `excluded_from_consensus = true` с reason `'flip_arbitration_timeout'`.
 
 ### Производительность
 
-Запрос за 7 дней по `place_signals` при 500K rows на горизонте 1-2 лет:
+Запрос hourly (паттерны 4-5) за 7 дней по `place_signals` при 500K rows на горизонте 1-2 лет:
 
 - Партиционирование по месяцам (P1 в REVIEW-BACKLOG) → запрос затрагивает 1-2 партиции, ~100K rows
-- Индекс `idx_signals_created_at` (есть в ТЗ §4.3)
-- Group by + aggregation на 100K rows на 1 vCPU — ~100-300 ms
-- Запускается раз в час в `anomaly_detect` — приемлемо
+- Новый индекс `idx_signals_subnet_window` покрывает GROUP BY обоих паттернов
+- На 1 vCPU: ~100-300 ms суммарно — приемлемо
+- Запускается раз в час в `anomaly_detect` (advisory_lock против overlap с собой)
 
-Если перформанс деградирует — поднять окно с 7 дней до 3 дней (ловим самые свежие атаки) и добавить отдельный nightly job на 7-day deep scan.
+Запрос nightly (паттерн 6): ~500ms-1s на 100K rows. Запускается в 04:30 (после daily-парсера 03:00, до утреннего трафика).
+
+Если перформанс деградирует — окно с 7 дней до 3 дней + отдельный nightly job для 7-day deep scan.
 
 ### IP-адреса и анонимность
 

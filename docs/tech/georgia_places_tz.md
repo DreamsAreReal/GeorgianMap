@@ -120,16 +120,22 @@
 
 ### 2.3. Бюджет памяти на VPS (1 GB RAM)
 
+Пересчитанный после ADR-0003 (Server GC) и ADR-0006 (OpenTelemetry). См. [ADR-0001 §RAM map](adr/0001-monolith-on-single-vps.md#ram-бюджет) — единый источник правды.
+
 | Компонент | Лимит | Комментарий |
 |-----------|-------|-------------|
 | Ubuntu система | ~150 MB | базовый minimal |
 | Postgres | ~250 MB | `shared_buffers=128MB`, `max_connections=20` |
-| .NET API | ~200 MB | Server GC + concurrent + `GCHeapHardLimit=200MB` (ADR-0003); `mem_limit: 230m` в compose (запас на native + thread stacks) |
+| .NET API | ~260 MB | `mem_limit: 260m` = `GCHeapHardLimit=200MB` (ADR-0003) + ~30 MB Server GC overhead + ~30 MB OTel SDK (ADR-0006) |
 | Nginx | ~20 MB | alpine |
-| Кэш ОС / запас | ~380 MB | |
-| **Парсер** | ~300 MB | **запускается только когда API спит (03:00-06:00)** |
+| Кэш ОС / запас | ~320 MB | поглощается page cache Postgres |
+| **Парсер** | ~320 MB | `mem_limit: 320m` = ~300 MB Python runtime + httpx/bs4/psycopg + ~10 MB Python OTel SDK (ADR-0006). **Запускается только когда API спит (03:00-06:00)** |
 
-Своп 2 GB обязательно (`/swapfile`, `swappiness=10`).
+**Pessimistic-сумма** (одновременно работающее ядро без парсера): 150 + 250 + 260 + 20 = **680 MB**, запас ~320 MB на page cache + sysctl-pinned dirty buffers.
+
+**Pessimistic-сумма** в окне overlap (03:00-06:00, парсер активен, API спит на минимуме ~30 MB idle): 150 + 250 + 30 + 20 + 320 = **770 MB**, запас ~230 MB.
+
+Своп 2 GB обязательно (`/swapfile`, `swappiness=10`) — страховка для пиковых аллокаций GC и pg autovacuum.
 
 ---
 
@@ -644,60 +650,88 @@ CREATE TABLE api_budget_counters (
 );
 ```
 
-Перед каждым вызовом Gemini — **атомарная** операция check+increment:
+Перед каждым вызовом Gemini — **атомарная** операция check+increment в **одной транзакции**.
+
+Ключевая идея: оба счётчика (глобальный и категорийный) увеличиваются **в одном CTE-запросе**, причём категорийный — только при условии успешного увеличения глобального. Если категорийный лимит исчерпан (и не критическая категория), весь CTE откатывается через `ROLLBACK`. Никаких ручных компенсирующих UPDATE-ов между двумя `db.execute`.
 
 ```python
 def try_reserve_gemini(category: str) -> bool:
     """
     Атомарно резервирует один вызов Gemini для категории.
-    Возвращает True если вызов разрешён, False — если лимит исчерпан.
-    Никаких race conditions: при параллельных воркерах суммарный counter
-    не превысит лимит даже на 1.
+    True — вызов разрешён, оба счётчика увеличены.
+    False — лимит исчерпан, ничего не изменилось.
+
+    Race conditions невозможны: при параллельных воркерах сериализация
+    обеспечивается на уровне Postgres row locks внутри UPDATE.
     """
     today = date.today()
     cat_budget = DAILY_BUDGETS[f"gemini_{category}"]
     total_budget = DAILY_BUDGETS["gemini_total_rpd"]
     is_critical = category == "ugc_classification"
 
-    with db.transaction():
-        # Один UPDATE проверяет оба лимита и увеличивает оба счётчика, либо ничего
-        result = db.execute("""
-            WITH global_check AS (
+    # psycopg3: with conn.transaction() гарантирует BEGIN/COMMIT/ROLLBACK
+    # вокруг всего блока. Любое исключение или явный raise → ROLLBACK.
+    with conn.transaction():
+        row = conn.execute("""
+            INSERT INTO api_budget_counters (api_name, date, counter)
+            VALUES ('gemini_total', %(today)s, 0), (%(cat_name)s, %(today)s, 0)
+            ON CONFLICT (api_name, date) DO NOTHING;
+
+            WITH global_inc AS (
                 UPDATE api_budget_counters
-                SET counter = counter + 1, updated_at = now()
-                WHERE api_name = 'gemini_total' AND date = %s
-                  AND counter < %s
+                SET counter = counter + 1
+                WHERE api_name = 'gemini_total'
+                  AND date = %(today)s
+                  AND counter < %(total_budget)s
                 RETURNING counter
             ),
-            category_check AS (
+            category_inc AS (
                 UPDATE api_budget_counters
-                SET counter = counter + 1, updated_at = now()
-                WHERE api_name = %s AND date = %s
-                  AND (counter < %s OR %s)
-                  AND EXISTS (SELECT 1 FROM global_check)
+                SET counter = counter + 1
+                WHERE api_name = %(cat_name)s
+                  AND date = %(today)s
+                  AND (counter < %(cat_budget)s OR %(is_critical)s)
+                  AND EXISTS (SELECT 1 FROM global_inc)
                 RETURNING counter
             )
             SELECT
-                (SELECT counter FROM global_check) AS gtotal,
-                (SELECT counter FROM category_check) AS gcat
-        """, (today, total_budget,
-              f"gemini_{category}", today, cat_budget, is_critical))
+                (SELECT counter FROM global_inc) AS gtotal,
+                (SELECT counter FROM category_inc) AS gcat;
+        """, {
+            'today': today,
+            'cat_name': f"gemini_{category}",
+            'total_budget': total_budget,
+            'cat_budget': cat_budget,
+            'is_critical': is_critical,
+        }).fetchone()
 
-        row = result.fetchone()
-        if row is None or row.gtotal is None:
-            return False  # глобальный лимит достигнут
-        if row.gcat is None and not is_critical:
-            # глобальный увеличили, категорийный нет — откатим глобальный
-            db.execute("""
-                UPDATE api_budget_counters
-                SET counter = counter - 1
-                WHERE api_name = 'gemini_total' AND date = %s
-            """, (today,))
+        # Случай 1: глобальный лимит достигнут — обе UPDATE не сработали,
+        # CTE вернул NULL/NULL. Транзакция тоже ничего не изменила.
+        if row.gtotal is None:
             return False
+
+        # Случай 2: глобальный сработал, категорийный — нет (и не critical).
+        # Откатываем всю транзакцию, чтобы global_inc не закрепился.
+        if row.gcat is None:
+            raise _BudgetExhausted()  # триггерит ROLLBACK через with-блок
+
+        # Случай 3: оба сработали — COMMIT через выход из with-блока.
         return True
+
+
+class _BudgetExhausted(Exception):
+    """Внутренний sentinel для отката транзакции."""
+    pass
+
+
+def try_reserve_gemini_safe(category: str) -> bool:
+    try:
+        return try_reserve_gemini(category)
+    except _BudgetExhausted:
+        return False
 ```
 
-> **Почему так:** прежняя версия (`get_counter` + `if` + `increment_counter`) имела race condition — два параллельных воркера (hourly + daily при overlap) могли пройти проверку одновременно и суммарно превысить лимит. Закрыто P0 из REVIEW-BACKLOG.
+> **Почему так:** прежняя версия делала ручной компенсирующий UPDATE при провале категорийного лимита. Если процесс падал между двумя `db.execute` — глобальный счётчик завышался навсегда, постепенно исчерпывая квоту даром. Новая версия использует ROLLBACK через исключение — атомарность гарантируется Postgres-ом, не Python-кодом. Закрывает P0 из 2-го авто-ревью.
 
 При исчерпании лимита: задача попадает в `processing_queue` с `next_retry_at = tomorrow 00:01 UTC`. Не теряется, обработается завтра.
 
@@ -815,10 +849,18 @@ async def fetch_channel_incremental(channel: str):
             raw_content=p.text,
             metadata={"date": p.date, "url": p.url}
         )
-    
+
     if new_posts:
         await db.update_last_seen(channel, max(p.id for p in new_posts))
-    
+
+    # ОБЯЗАТЕЛЬНО: per-channel метрика для алерта ADR-0006 №9
+    # (silent failure 3/10 каналов не сработает на общий threshold).
+    # cardinality safe: ~10-20 каналов фиксированный set.
+    metrics.increment(
+        "parser_channel_items_total",
+        labels={"channel": channel},
+        value=len(deduped),
+    )
     return deduped
 ```
 
@@ -874,7 +916,33 @@ def fetch_and_cache_photos(place: Place, photo_refs: list[str], max_photos=5):
 Только JSON, без markdown.
 ```
 
-Извлечения с `confidence < 0.6` отбрасываются.
+Извлечения с `confidence < 0.6` отбрасываются — но **обязательно** инкрементируем счётчик для алертинга silent degradation (см. ADR-0006 алерт #4):
+
+```python
+def process_extraction(raw_text: str, category: str) -> list[Signal]:
+    """Извлекает атрибуты из текста через Gemini, фильтрует по confidence."""
+    if not try_reserve_gemini(category):
+        metrics.increment("gemini_calls_blocked_total", labels={"category": category, "reason": "budget"})
+        return []
+
+    metrics.increment("gemini_calls_total", labels={"category": category})
+
+    response = gemini_call(raw_text, category)
+    signals = []
+    for attr_key, payload in response.get("attributes", {}).items():
+        confidence = payload.get("confidence", 0.0)
+        if confidence < 0.6:
+            # CRITICAL: без этой метрики silent degradation не детектируется
+            metrics.increment(
+                "gemini_low_confidence_discarded_total",
+                labels={"category": category, "attribute_key": attr_key},
+            )
+            continue
+        signals.append(Signal(attr_key, payload["value"], confidence, payload.get("evidence")))
+    return signals
+```
+
+Алерт ADR-0006 №4 (`gemini_low_confidence_discarded_total / gemini_calls_total > 0.4 for 1h`) триггерится когда Gemini массово возвращает мусор (prompt drift, model deprecation, encoding bug в источниках).
 
 ---
 
@@ -1669,8 +1737,10 @@ SELECT
     p.name,
     p.category,
     p.geom,
-    p.lat AS lat,           -- денормализуем координаты для быстрых JSON-ответов
-    p.lng AS lng,
+    -- денормализуем координаты для быстрых JSON-ответов;
+    -- в places хранится geom GEOGRAPHY(POINT, 4326), отдельных колонок lat/lng нет
+    ST_Y(p.geom::geometry) AS lat,
+    ST_X(p.geom::geometry) AS lng,
     p.google_rating,
     p.google_reviews_count,
     -- денормализуем горячие фильтр-атрибуты в отдельные колонки, JSONB остаётся для долгого хвоста

@@ -173,6 +173,43 @@ P1 алерты — только email:
 В таблицу env vars добавить:
 
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | yes | — | OTLP HTTP endpoint Grafana Cloud |
-| `OTEL_EXPORTER_OTLP_HEADERS` | yes | — | `Authorization=Basic <base64(instanceId:token)>` |
+| `OTEL_EXPORTER_OTLP_HEADERS_FILE` | yes | `/run/secrets/otlp_headers` | Путь к файлу с `Authorization=Basic <base64(...)>` (см. ниже) |
 | `OTEL_SERVICE_NAME` | yes | — | `georgia-places-api` или `georgia-places-parser` |
-| `SENTRY_DSN` | yes | — | Sentry project DSN |
+| `SENTRY_DSN` | yes | `/run/secrets/sentry_dsn` (через `SENTRY_DSN_FILE`) | Sentry DSN — также через secret |
+
+### Почему НЕ env-переменная для credentials
+
+`OTEL_EXPORTER_OTLP_HEADERS` содержит base64 Grafana Cloud token. Если положить его в обычную env-переменную:
+- `docker compose config` дампит весь конфиг в stdout — токен попадает в CI логи.
+- `docker inspect <container>` показывает env — доступно любому с доступом к Docker socket.
+- Crash dump / `dotnet-trace` могут включать env.
+- Сам OTel SDK в debug-уровне может залогировать env при старте — credential попадёт в Loki, защищаемый этим же токеном.
+
+**Решение:** Docker secrets (или mount файла с правами 0400).
+
+```yaml
+# docker-compose.yml
+services:
+  api:
+    secrets:
+      - otlp_headers
+      - sentry_dsn
+    environment:
+      OTEL_EXPORTER_OTLP_HEADERS_FILE: /run/secrets/otlp_headers
+      SENTRY_DSN_FILE: /run/secrets/sentry_dsn
+
+secrets:
+  otlp_headers:
+    file: ./secrets/otlp_headers.txt   # 0400, в .gitignore
+  sentry_dsn:
+    file: ./secrets/sentry_dsn.txt
+```
+
+Файл `secrets/otlp_headers.txt` содержит ровно одну строку:
+```
+Authorization=Basic <base64(instanceId:token)>
+```
+
+OpenTelemetry SDK ≥1.7 читает `*_HEADERS_FILE` нативно. Sentry SDK — через лёгкий `Sentry.Init(o => o.Dsn = File.ReadAllText(Environment.GetEnvironmentVariable("SENTRY_DSN_FILE")).Trim())`.
+
+`.gitignore` уже исключает `secrets/` (см. PR #1).

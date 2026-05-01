@@ -69,7 +69,9 @@ environment:
   DOTNET_GCHeapHardLimit: "200000000"
 ```
 
-В docker-compose `mem_limit: 230m` (запас 30 MB поверх heap limit на native + thread stacks).
+В docker-compose `mem_limit: 260m` — складывается из: 200 MB `GCHeapHardLimit` + ~30 MB Server GC overhead + ~30 MB OTel SDK (ADR-0006). Единый источник правды по RAM-распределению — [ADR-0001 §RAM бюджет](0001-monolith-on-single-vps.md#ram-бюджет).
+
+> **Update 2026-05-01:** изначально ADR указывал `mem_limit: 230m` без учёта OTel SDK (ADR-0006 принят позже). Поднят до 260m.
 
 ## Последствия
 
