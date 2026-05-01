@@ -29,6 +29,9 @@ certs/
 # rclone (R2 backup credentials)
 rclone.conf
 
+# Docker secrets (mounted via compose secrets:)
+secrets/
+
 # OS
 .DS_Store
 Thumbs.db

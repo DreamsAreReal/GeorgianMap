@@ -4,7 +4,7 @@
 
 ## Стек (планируется)
 
-- TBD: vanilla JS / Vue / Svelte — решение в ADR.
+- TBD: vanilla JS / Vue / Svelte — выбор фреймворка отложен до Этапа 3 (см. ТЗ §13).
 - MapLibre GL JS (тайлы от MapTiler)
 - Cloudflare Turnstile (anti-bot для UGC форм)
 

@@ -78,11 +78,32 @@ docker compose -f source/infra/docker-compose.yml up -d
 | `HEALTHCHECKS_BACKUP_UUID` | yes | — | UUID для пинга Healthchecks.io после бэкапа |
 | `ASPNETCORE_ENVIRONMENT` | no | `Production` | `Development` / `Production` |
 | `DOTNET_GCHeapHardLimit` | no | — | Лимит .NET GC heap в байтах (см. ADR-0003) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | yes | — | OTLP HTTP endpoint Grafana Cloud (см. ADR-0006) |
+| `OTEL_EXPORTER_OTLP_HEADERS_FILE` | yes | `/run/secrets/otlp_headers` | Путь к файлу с auth header — **через Docker secret, НЕ в env-переменной** (см. ADR-0006) |
+| `OTEL_SERVICE_NAME` | yes | — | `georgia-places-api` или `georgia-places-parser` |
+| `SENTRY_DSN_FILE` | yes | `/run/secrets/sentry_dsn` | Путь к файлу с Sentry DSN — также через Docker secret |
 
-## Ветки и protection
+## Ветки и workflow
 
-- `main` — protected. Direct push запрещён, требуется PR + linear history + resolved threads.
-- `develop` — рабочая ветка. Все правки сюда, затем PR в `main`.
+Trunk-based с feature branches (см. [ADR-0005](docs/tech/adr/0005-branch-protection-model.md)):
+
+- `main` — protected. Direct push запрещён. Требуется PR + linear history + resolved threads. Force push и удаление невозможны (ruleset).
+- `feat/<тема>`, `fix/<тема>` — рабочие feature branches от `main`. После squash-merge удаляются.
+
+Стандартный flow:
+
+```bash
+git checkout main && git pull
+git checkout -b feat/my-feature
+# правки + коммиты
+git push origin feat/my-feature
+gh pr create --base main --head feat/my-feature
+# CI отработает на PR
+gh pr merge --squash --delete-branch
+git checkout main && git pull
+```
+
+Ветка `develop` существует исторически, но **не используется** — следующие правки идут в feature-ветки.
 
 ## Лицензия
 

@@ -56,7 +56,32 @@ Georgia Places — бесплатный сервис без аккаунтов, 
 - p95 latency на origin > 500ms при upgrade VPS до 2 vCPU / 2 GB
 - RAM usage > 85% устойчиво в течение недели
 
+## RAM бюджет
+
+> **Update 2026-05-01:** пересчитано после ADR-0003 (Server GC overhead) и ADR-0006 (OpenTelemetry SDK overhead). Это **единый источник правды** по RAM-распределению — все docker-compose `mem_limit` должны соответствовать таблице ниже.
+
+| Компонент | mem_limit | Из чего складывается |
+|-----------|-----------|----------------------|
+| Ubuntu система | ~150 MB | базовый minimal Ubuntu Server |
+| Postgres | 250 MB | `shared_buffers=128MB`, `work_mem=4MB`, `max_connections=20` |
+| .NET API | **260 MB** | 200 MB `GCHeapHardLimit` (ADR-0003) + ~30 MB Server GC overhead + ~30 MB OTel SDK + Sentry SDK (ADR-0006) |
+| Nginx | 20 MB | alpine reverse proxy |
+| **Парсер** (профиль `manual`) | **320 MB** | ~300 MB Python runtime + httpx + bs4 + psycopg3 + ~10 MB Python OTel SDK (ADR-0006) |
+
+**Pessimistic-сумма** (ядро без парсера, обычное окно): `150 + 250 + 260 + 20 = 680 MB`. Запас ~320 MB — поглощается page cache Postgres-а (что улучшает производительность read-запросов).
+
+**Pessimistic-сумма** в окне overlap (03:00-06:00, парсер активен, API в idle ~30 MB): `150 + 250 + 30 + 20 + 320 = 770 MB`. Запас ~230 MB.
+
+**Своп** 2 GB обязательно (`/swapfile`, `swappiness=10`) — страховка для GC-пиков и pg autovacuum.
+
+**Disk бюджет** (типичный VPS 20-25 GB): Postgres data ~3-5 GB при 50K places + 500K signals, WAL ~500 MB, materialized view temp при `REFRESH CONCURRENTLY` ~100-200 MB peak, логи (с logrotate) ~1 GB, backups локальные не храним (R2). Итого ~5-7 GB. Запас ~15 GB.
+
+**Триггеры пересмотра RAM-map:**
+- Любой новый ADR, добавляющий процесс/SDK на VPS, обязан обновить эту таблицу
+- При устойчивом RSS API > 240 MB или Postgres > 270 MB — алерт, пересмотр
+
 ## Связанные ADR
 
 - ADR-0002 (RPO=24h, no WAL archiving) — следствие single-VPS выбора
 - ADR-0003 (Server GC with heap limit) — настройка под shared 1 GB RAM
+- ADR-0006 (Observability stack) — добавляет OTel SDK overhead в RAM-map
