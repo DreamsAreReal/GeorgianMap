@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/GeorgiaPlaces.Api/GeorgiaPlaces.Api.csproj" />
+    <Project Path="src/GeorgiaPlaces.Application/GeorgiaPlaces.Application.csproj" />
+    <Project Path="src/GeorgiaPlaces.Domain/GeorgiaPlaces.Domain.csproj" />
+    <Project Path="src/GeorgiaPlaces.Infrastructure/GeorgiaPlaces.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/GeorgiaPlaces.Tests.Unit/GeorgiaPlaces.Tests.Unit.csproj" />
+    <Project Path="tests/GeorgiaPlaces.Tests.Integration/GeorgiaPlaces.Tests.Integration.csproj" />
+  </Folder>
+</Solution>
