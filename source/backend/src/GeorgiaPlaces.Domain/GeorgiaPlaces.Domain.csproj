@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>GeorgiaPlaces.Domain</RootNamespace>
+    <AssemblyName>GeorgiaPlaces.Domain</AssemblyName>
+  </PropertyGroup>
+
+</Project>

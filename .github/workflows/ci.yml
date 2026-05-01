@@ -29,10 +29,53 @@ jobs:
       - name: Check no secrets committed
         run: |
           # Simple grep for obvious secret patterns. Will be replaced by gitleaks once stack is in place.
-          ! grep -rE "(AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\\-_]{35}|gh[ps]_[A-Za-z0-9]{36,})" \
-            --include="*.cs" --include="*.py" --include="*.json" --include="*.yml" \
+          ! grep -rE "(AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\\-_]{35}|gh[ps]_[A-Za-z0-9]{36,}|glc_[A-Za-z0-9]{40,})" \
+            --include="*.cs" --include="*.py" --include="*.json" --include="*.yml" --include="*.sh" \
             --exclude-dir=node_modules --exclude-dir=.git . || \
             { echo "Possible secret detected"; exit 1; }
 
-  # Backend, parser, frontend jobs will be added as code lands.
-  # Each must pass before PR can merge into main (will be wired into branch ruleset).
+  backend:
+    name: Backend build + unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: source/backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore
+        run: dotnet restore GeorgiaPlaces.slnx
+
+      - name: Build
+        run: dotnet build GeorgiaPlaces.slnx -c Release --no-restore
+
+      - name: Unit tests
+        run: dotnet test tests/GeorgiaPlaces.Tests.Unit/GeorgiaPlaces.Tests.Unit.csproj -c Release --no-build --logger 'trx;LogFileName=unit.trx'
+
+      # Integration tests require Docker (Testcontainers); enabled once GitHub-hosted runners
+      # confirm reliable Docker availability for the test workload.
+
+  infra:
+    name: Infra docker-compose validation
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: source/infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare .env from example
+        run: cp .env.example .env
+
+      - name: Prepare placeholder secrets
+        run: |
+          mkdir -p secrets
+          echo "Authorization=Basic placeholder" > secrets/otlp_headers
+          echo "https://placeholder@sentry.example/0" > secrets/sentry_dsn
+
+      - name: Validate compose syntax
+        run: docker compose config --quiet
