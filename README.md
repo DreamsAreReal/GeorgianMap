@@ -37,23 +37,39 @@
 
 ## Quick Start
 
-> Будет дополнен по мере появления кода. Пока — клонируем и читаем ТЗ:
-
 ```bash
 git clone https://github.com/DreamsAreReal/GeorgianMap.git
-cd GeorgianMap
-open docs/tech/georgia_places_tz.md   # macOS
+cd GeorgianMap/source/infra
+cp .env.example .env
+# отредактировать .env (см. таблицу ниже) + создать secrets/ (см. SECRETS.md)
+docker compose up -d            # билд API локально, удобно для dev
+curl http://localhost/api/v1/health
 ```
 
-После Этапа 1 (см. §13 ТЗ) появится:
+## Production deploy (на VPS)
+
+Используем prebuilt-образ из ghcr.io вместо локального билда (см. [ADR-0009](docs/tech/adr/0009-image-registry-ghcr.md)) — VPS не тратит RAM на компиляцию.
 
 ```bash
-cp source/infra/.env.example .env
-# отредактировать .env (см. таблицу ниже)
-docker compose -f source/infra/docker-compose.yml up -d
-# API на http://localhost:8080
-# Swagger на http://localhost:8080/swagger
+# на VPS, в /opt/georgia-places/source/infra
+git pull
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.prod.yml \
+  pull api
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.prod.yml \
+  up -d
 ```
+
+Откат на конкретный коммит:
+
+```bash
+IMAGE_TAG=sha-abc1234 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d api
+```
+
+Образы: `ghcr.io/dreamsarereal/georgianmap-api:latest` (rolling) и `:sha-<7chars>` (для отката). Публикуются автоматически из CI на каждый push в `main`.
 
 ## Переменные окружения
 
