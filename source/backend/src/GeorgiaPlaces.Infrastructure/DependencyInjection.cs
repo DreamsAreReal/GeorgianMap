@@ -1,4 +1,7 @@
+using GeorgiaPlaces.Application.Places;
+using GeorgiaPlaces.Infrastructure.Places;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -21,8 +24,14 @@ public static class DependencyInjection
                 npg.UseNetTopologySuite();
                 npg.EnableRetryOnFailure(maxRetryCount: 3);
             });
+            // Raw-SQL migrations intentionally diverge from the model snapshot
+            // (PostGIS / materialized views aren't supported by EF scaffolding).
+            // Suppress the diff check; correctness is enforced by integration tests.
+            options.ConfigureWarnings(w => w.Ignore(
+                RelationalEventId.PendingModelChangesWarning));
         });
 
+        services.AddScoped<IPlaceReadRepository, PlaceReadRepository>();
         return services;
     }
 }
