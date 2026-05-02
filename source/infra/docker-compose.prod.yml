@@ -1,0 +1,14 @@
+# docker-compose.prod.yml — production override.
+# Replaces local API build with the published ghcr.io image (ADR-0009).
+#
+# Usage on VPS:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml pull api
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# To pin a specific revision (rollback):
+#   IMAGE_TAG=sha-abc1234 docker compose -f ... -f ... up -d api
+
+services:
+  api:
+    build: !reset null
+    image: ghcr.io/dreamsarereal/georgianmap-api:${IMAGE_TAG:-latest}

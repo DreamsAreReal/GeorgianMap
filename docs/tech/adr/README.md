@@ -21,3 +21,4 @@
 | 0006 | [Observability stack](0006-observability-stack.md) | Accepted | 2026-04-30 |
 | 0007 | [Brigading detection — sliding 7-day window](0007-brigading-detection.md) | Accepted | 2026-04-30 |
 | 0008 | [Consensus override thresholds for high-impact attributes](0008-consensus-override-thresholds.md) | Accepted | 2026-04-30 |
+| 0009 | [Image registry on ghcr.io](0009-image-registry-ghcr.md) | Accepted | 2026-05-02 |
