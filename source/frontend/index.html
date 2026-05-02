@@ -9,9 +9,14 @@
           href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
           integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
           crossorigin="">
+    <link rel="stylesheet"
+          href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
+    <link rel="stylesheet"
+          href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
             integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
             crossorigin=""></script>
+    <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 
     <style>
         * { box-sizing: border-box; }
@@ -80,7 +85,7 @@
         ['market', 'рынки'],
     ];
 
-    const map = L.map('map').setView([42.0, 43.5], 7);
+    const map = L.map('map', { preferCanvas: true }).setView([42.0, 43.5], 7);
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
         maxZoom: 18,
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
@@ -89,8 +94,17 @@
     const filtersEl = document.getElementById('filters');
     const statsEl = document.getElementById('stats');
     const errEl = document.getElementById('err');
-    const layer = L.layerGroup().addTo(map);
+    // Cluster grouping handles 7K+ markers without DOM melting.
+    // chunkedLoading streams marker insertion in animation frames so the UI stays responsive.
+    const layer = L.markerClusterGroup({
+        chunkedLoading: true,
+        chunkInterval: 100,
+        showCoverageOnHover: false,
+        spiderfyOnMaxZoom: true,
+        maxClusterRadius: 60,
+    }).addTo(map);
     let activeCategory = '';
+    let loadToken = 0;  // cancels in-flight loads when filter changes
 
     function deeplinks(p) {
         const lat = p.lat, lng = p.lng, name = encodeURIComponent(p.name);
@@ -127,36 +141,58 @@
             .replaceAll('"', '&quot;');
     }
 
-    async function load() {
+    async function fetchPage(cursor) {
         const url = new URL(API, location.href);
         url.searchParams.set('limit', MAX);
         if (activeCategory) url.searchParams.set('category', activeCategory);
+        if (cursor) url.searchParams.set('cursor', cursor);
 
-        statsEl.textContent = 'Загружаю…';
+        const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+        if (!r.ok) {
+            const body = await r.text();
+            throw new Error(`HTTP ${r.status}: ${body.slice(0, 120)}`);
+        }
+        return await r.json();
+    }
+
+    async function load() {
+        const myToken = ++loadToken;
+        layer.clearLayers();
         errEl.textContent = '';
+        statsEl.textContent = 'Загружаю…';
 
-        let json;
+        const buffer = [];
+        let cursor = null;
+        let total = 0;
+        const MAX_PAGES = 20;  // hard cap = 10K places, plenty for Georgia
+
         try {
-            const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
-            if (!r.ok) {
-                const body = await r.text();
-                throw new Error(`HTTP ${r.status}: ${body.slice(0, 120)}`);
+            for (let page = 0; page < MAX_PAGES; page++) {
+                const json = await fetchPage(cursor);
+                if (myToken !== loadToken) return;  // user switched filter mid-fetch
+
+                const places = json.places || [];
+                for (const p of places) {
+                    const m = L.marker([p.lat, p.lng]);
+                    m.bindPopup(() => popup(p), { maxWidth: 280 });
+                    buffer.push(m);
+                }
+                total += places.length;
+                statsEl.textContent = `Загружаю… ${total}`;
+
+                if (!json.hasMore || !json.nextCursor) break;
+                cursor = json.nextCursor;
             }
-            json = await r.json();
         } catch (e) {
+            if (myToken !== loadToken) return;
             errEl.textContent = `Ошибка: ${e.message}`;
             statsEl.textContent = '—';
             return;
         }
 
-        layer.clearLayers();
-        const places = json.places || [];
-        for (const p of places) {
-            L.marker([p.lat, p.lng])
-                .bindPopup(popup(p), { maxWidth: 280 })
-                .addTo(layer);
-        }
-        statsEl.textContent = `${places.length} мест${json.hasMore ? ' (и ещё, перепиши limit)' : ''}`;
+        if (myToken !== loadToken) return;
+        layer.addLayers(buffer);  // single bulk add — much faster than per-marker
+        statsEl.textContent = `${total.toLocaleString('ru-RU')} мест`;
     }
 
     function buildFilters() {
