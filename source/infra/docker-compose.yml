@@ -116,6 +116,26 @@ services:
     networks:
       - gp-net
 
+  # Cloudflare Quick Tunnel — даёт публичный *.trycloudflare.com URL без аккаунта/домена.
+  # Профиль `tunnel` — стартует только явно (`docker compose --profile tunnel up -d`),
+  # чтобы не «светить» dev-сервис в публичный интернет случайно.
+  # URL ищем в логах: `docker compose logs tunnel | grep trycloudflare.com`.
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: gp-tunnel
+    profiles: ["tunnel"]
+    restart: on-failure
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+    depends_on:
+      nginx:
+        condition: service_healthy
+    command: ["tunnel", "--no-autoupdate", "--url", "http://nginx:80"]
+    networks:
+      - gp-net
+
   # Profile=manual: запускается только явно (`docker compose --profile manual run --rm parser`)
   # либо из cron на VPS. Не стартует при `docker compose up -d`.
   parser:
