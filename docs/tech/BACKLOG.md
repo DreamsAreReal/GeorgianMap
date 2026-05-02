@@ -41,19 +41,20 @@
 
 ---
 
-## Epic 2 — Parser (Python, Tier-1 sources) (⬜ todo)
+## Epic 2 — Parser (Python, Tier-1 sources) (🚧 wip)
 
 §13 Этап 2. **Цель: 5K-50K мест в БД от authoritative источников.**
 
 | # | Задача | Статус | Refs | Заметки |
 |---|--------|--------|------|---------|
-| 2.1 | Каркас Python проекта (pyproject.toml, ruff, pytest) | ⬜ | source/parser/ | |
-| 2.2 | Dockerfile парсера (slim, OTel SDK включён) | ⬜ | TZ §6 | |
+| 2.1 | Каркас Python проекта (pyproject.toml, ruff, pytest) | ✅ | #8 | tests пока нет |
+| 2.2 | Dockerfile парсера (slim, OTel SDK включён) | ✅ (без OTel) | #8 | OTel добавим в Epic 6 |
 | 2.3 | Staging-схема в БД (раздел §6.4.1) | ⬜ | EF migration | `staging.places`, `staging.place_signals` |
 | 2.4 | Source: Google Places API (`google_places_enrich`) | ⬜ | TZ §6.5, §11 | Polly-стиль retry + rate-limit |
-| 2.5 | Source: Geofabrik OSM dump (`osm_import`) | ⬜ | TZ §6 | Weekly, osmium |
-| 2.6 | Source: Wikidata SPARQL (`wikidata_enrich`) | ⬜ | TZ §6 | Weekly |
-| 2.7 | Atomic merge `staging → public` (advisory_lock) | ⬜ | REVIEW-BACKLOG P1 | Закроет staging-merge race |
+| 2.5 | Source: Geofabrik OSM dump (osm_import) — fallback на Overpass | ⬜ | TZ §6 | Когда Overpass упрётся в rate-limit |
+| 2.6 | Source: Overpass per-tag — Tier-1 OSM | ✅ | #8 / #10 | 19 per-tag запросов, fallback 3 endpoints, form-encoded `data=` |
+| 2.7 | Source: Wikidata SPARQL (`wikidata_enrich`) | ⬜ | TZ §6 | Weekly |
+| 2.8 | Atomic merge `staging → public` (advisory_lock) | ⬜ | REVIEW-BACKLOG P1 | Закроет staging-merge race; пока пишем напрямую в `places` |
 | 2.8 | Healthchecks.io ping after each job | ⬜ | TZ §10.6 | |
 
 ---
@@ -83,14 +84,14 @@
 
 | # | Задача | Статус | Refs | Заметки |
 |---|--------|--------|------|---------|
-| 4.1 | ADR-0010: выбор фреймворка (vanilla / Vue / Svelte) | ⬜ | source/frontend/README.md | |
-| 4.2 | MapLibre GL + MapTiler tiles | ⬜ | TZ §1, §11 | |
-| 4.3 | Маркеры мест из `/api/v1/places` | ⬜ | TZ §8.1 | |
-| 4.4 | Динамические фильтры из `/api/v1/filters` | ⬜ | TZ §8.4 | |
-| 4.5 | Карточка места (`/api/v1/places/{id}`) с deeplinks | ⬜ | TZ §8.2 | |
-| 4.6 | UGC форма + Cloudflare Turnstile | ⬜ | TZ §7.1, §7.4 | |
-| 4.7 | A→B route picker | ⬜ | TZ §8.5 | + dislaimer о routing |
-| 4.8 | Cloudflare Pages деплой | ⬜ | TZ §10 | |
+| 4.1 | Выбор фреймворка (vanilla / Vue / Svelte) | ✅ | #8 | Vanilla JS + Leaflet — для MVP достаточно. Если будет UGC форма — пересмотрим |
+| 4.2 | Карта с тайлами (Leaflet + OSM raster) | ✅ | #8 | Без MapTiler ключа — бесплатно, для MVP ок |
+| 4.3 | Маркеры мест из `/api/v1/places` + clustering | ✅ | #8 / #9 | Leaflet.markercluster, cursor-пагинация, все 7K мест |
+| 4.4 | Hardcoded category filter buttons | ✅ | #8 | Динамические из `/api/v1/filters` — после Epic 1.3 |
+| 4.5 | Карточка места (`/api/v1/places/{id}`) с deeplinks | 🚧 | TZ §8.2 | Deeplinks в popup ✅ (#8). Полная карточка ждёт Epic 1.2 |
+| 4.6 | UGC форма + Cloudflare Turnstile | ⬜ | TZ §7.1, §7.4 | После Epic 3 |
+| 4.7 | A→B route picker | ⬜ | TZ §8.5 | После Epic 1.4 + дислеймер о routing |
+| 4.8 | Cloudflare Pages деплой | ⬜ | TZ §10 | Сейчас фронт — статика в nginx; для прода вынесем на Pages |
 
 ---
 
@@ -100,8 +101,8 @@
 
 | # | Задача | Статус | Refs | Заметки |
 |---|--------|--------|------|---------|
-| 5.1 | Cron в контейнере (ofelia или alpine cron) | ⏭ | REVIEW-BACKLOG P1 | **Убирает host-cron — следующий PR**. Запускает: backup, verify-restore, refresh MV, signals_aggregate, anomaly_detect |
-| 5.2 | Cloudflare Tunnel (для public access локального dev) | ✅ | этот PR | `tunnel` сервис в compose |
+| 5.1 | Cron в контейнере (ofelia) | ✅ | #10 | Убирает host-cron. Сейчас scheduled: parser daily 03:00 UTC, REFRESH MV hourly @ :25. Backup/verify-restore добавятся когда подключим R2 (Epic 7) |
+| 5.2 | Cloudflare Tunnel (для public access локального dev) | ✅ | #8 | `tunnel` сервис в compose, профиль `tunnel` |
 | 5.3 | TLS на Nginx (Let's Encrypt via certbot container) | ⬜ | TZ §10 | Только для prod |
 | 5.4 | PgBouncer (transaction mode) | ⬜ | REVIEW-BACKLOG P1 | Защита connection pool |
 | 5.5 | logrotate в контейнере для file-sink логов | ⬜ | REVIEW-BACKLOG P1 | После migration на ofelia — встроится |

@@ -136,8 +136,10 @@ services:
     networks:
       - gp-net
 
-  # Profile=manual: запускается только явно (`docker compose --profile manual run --rm parser`)
-  # либо из cron на VPS. Не стартует при `docker compose up -d`.
+  # Parser image is built but no service runs it on `up -d` — ofelia
+  # creates ephemeral containers from this image at scheduled times,
+  # and `docker compose --profile manual run --rm parser` is still
+  # available for ad-hoc owner-initiated runs.
   parser:
     build:
       context: ../parser
@@ -159,6 +161,29 @@ services:
       - sentry_dsn
     environment:
       OTEL_SERVICE_NAME: georgia-places-parser
+    networks:
+      - gp-net
+
+  # Ofelia — single in-Docker job scheduler, replaces host-side cron entirely
+  # (BACKLOG Epic 5.1). Reads /etc/ofelia/config.ini, talks to Docker socket
+  # to spawn ephemeral parser containers and exec into postgres for MV refresh.
+  cron:
+    image: mcuadros/ofelia:0.3.16
+    container_name: gp-cron
+    restart: on-failure
+    deploy:
+      resources:
+        limits:
+          memory: 32M
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    command: ["daemon", "--config=/etc/ofelia/config.ini"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./ofelia/config.ini:/etc/ofelia/config.ini:ro
     networks:
       - gp-net
 
