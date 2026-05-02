@@ -2,6 +2,7 @@ using GeorgiaPlaces.Api.Endpoints;
 using GeorgiaPlaces.Api.Middleware;
 using GeorgiaPlaces.Application;
 using GeorgiaPlaces.Infrastructure;
+using Microsoft.EntityFrameworkCore;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
@@ -109,7 +110,8 @@ builder.Services.AddProblemDetails(opts =>
         {
             ctx.ProblemDetails.Extensions["correlationId"] = s;
         }
-        ctx.ProblemDetails.Extensions["instance"] ??= ctx.HttpContext.Request.Path.Value;
+        // Add instance only if not already supplied by the caller.
+        ctx.ProblemDetails.Instance ??= ctx.HttpContext.Request.Path.Value;
     };
 });
 builder.Services.AddExceptionHandler<GeorgiaPlaces.Api.ProblemDetailsExceptionHandler>();
@@ -169,7 +171,18 @@ app.UseMiddleware<CorrelationIdMiddleware>();
 app.UseCors(CorsPolicy);
 
 app.MapHealthEndpoints();
+app.MapPlacesEndpoints();
 app.MapOpenApi();
+
+// Apply pending migrations on startup. Acceptable on single-VPS monolith
+// (ADR-0001). Skip when launched under WebApplicationFactory tests that
+// configure their own DB.
+if (!app.Environment.IsEnvironment("IntegrationTest"))
+{
+    using var scope = app.Services.CreateScope();
+    var ctx = scope.ServiceProvider.GetRequiredService<GeorgiaPlaces.Infrastructure.AppDbContext>();
+    await ctx.Database.MigrateAsync().ConfigureAwait(false);
+}
 
 app.Run();
 
