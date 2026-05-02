@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <title>Georgia Places — карта интересных мест Грузии</title>
+
+    <link rel="stylesheet"
+          href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+          integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+          crossorigin="">
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+            crossorigin=""></script>
+
+    <style>
+        * { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        #map { height: 100vh; width: 100%; }
+
+        .controls {
+            position: absolute; top: 10px; left: 60px; z-index: 1000;
+            background: white; padding: 12px 14px; border-radius: 6px;
+            box-shadow: 0 1px 5px rgba(0,0,0,.3); max-width: calc(100vw - 80px);
+        }
+        .controls h1 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
+        .controls .stats { font-size: 12px; color: #666; margin-bottom: 8px; }
+        .controls .filters { display: flex; flex-wrap: wrap; gap: 4px; }
+        .filter-btn {
+            font-size: 11px; padding: 4px 8px; border: 1px solid #ccc;
+            background: #f5f5f5; cursor: pointer; border-radius: 3px;
+            font-family: inherit;
+        }
+        .filter-btn.active { background: #2563eb; color: white; border-color: #1e40af; }
+        .filter-btn:hover:not(.active) { background: #e5e5e5; }
+
+        .popup-name { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+        .popup-cat { font-size: 11px; color: #888; text-transform: uppercase; margin-bottom: 8px; }
+        .popup-attrs { font-size: 12px; margin-bottom: 8px; color: #444; }
+        .popup-links { display: flex; flex-direction: column; gap: 4px; }
+        .popup-links a {
+            display: block; padding: 5px 8px; background: #2563eb; color: white;
+            text-decoration: none; border-radius: 3px; font-size: 12px; text-align: center;
+        }
+        .popup-links a.alt { background: #16a34a; }
+        .popup-links a:hover { opacity: .9; }
+
+        .err { color: #dc2626; font-size: 12px; margin-top: 6px; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+
+    <div class="controls">
+        <h1>Georgia Places <small style="font-weight:400;color:#999;">(MVP)</small></h1>
+        <div class="stats" id="stats">Загружаю…</div>
+        <div class="filters" id="filters"></div>
+        <div class="err" id="err"></div>
+    </div>
+
+<script>
+(() => {
+    const API = '/api/v1/places';
+    const MAX = 500;
+    const CATEGORIES = [
+        ['', 'все'],
+        ['monastery', 'монастыри'],
+        ['fortress', 'крепости'],
+        ['viewpoint', 'виды'],
+        ['waterfall', 'водопады'],
+        ['mountain', 'горы'],
+        ['cave', 'пещеры'],
+        ['beach', 'пляжи'],
+        ['museum', 'музеи'],
+        ['restaurant', 'рестораны'],
+        ['park', 'парки'],
+        ['thermal_spring', 'тёплые источники'],
+        ['winery', 'винодельни'],
+        ['aquapark', 'аквапарки'],
+        ['market', 'рынки'],
+    ];
+
+    const map = L.map('map').setView([42.0, 43.5], 7);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 18,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+    }).addTo(map);
+
+    const filtersEl = document.getElementById('filters');
+    const statsEl = document.getElementById('stats');
+    const errEl = document.getElementById('err');
+    const layer = L.layerGroup().addTo(map);
+    let activeCategory = '';
+
+    function deeplinks(p) {
+        const lat = p.lat, lng = p.lng, name = encodeURIComponent(p.name);
+        return `
+            <div class="popup-links">
+                <a class="alt" href="https://yandex.com/maps/?ll=${lng},${lat}&z=15&pt=${lng},${lat},pm2rdm&text=${name}" target="_blank" rel="noopener">Яндекс Карты</a>
+                <a href="https://www.google.com/maps/search/?api=1&query=${lat},${lng}" target="_blank" rel="noopener">Google Maps</a>
+            </div>
+        `;
+    }
+
+    function popup(p) {
+        const attrs = p.keyAttributes || {};
+        const attrLines = [];
+        if (attrs.free === true) attrLines.push('🆓 бесплатно');
+        if (attrs.free === false && attrs.price_gel) attrLines.push(`💰 ${attrs.price_gel} GEL`);
+        if (attrs.parking === true) attrLines.push('🅿️ парковка');
+        if (attrs.dogs === 'friendly') attrLines.push('🐕 можно с собакой');
+        if (attrs.dogs === 'none') attrLines.push('🚫🐕');
+        if (attrs.road === 'unpaved') attrLines.push('🛣 грунтовка');
+        if (attrs.wheelchair_accessible === true) attrLines.push('♿ доступно');
+
+        return `
+            <div class="popup-name">${escape(p.name)}</div>
+            <div class="popup-cat">${p.category}</div>
+            ${attrLines.length ? `<div class="popup-attrs">${attrLines.join(' · ')}</div>` : ''}
+            ${deeplinks(p)}
+        `;
+    }
+
+    function escape(s) {
+        return String(s)
+            .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+            .replaceAll('"', '&quot;');
+    }
+
+    async function load() {
+        const url = new URL(API, location.href);
+        url.searchParams.set('limit', MAX);
+        if (activeCategory) url.searchParams.set('category', activeCategory);
+
+        statsEl.textContent = 'Загружаю…';
+        errEl.textContent = '';
+
+        let json;
+        try {
+            const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+            if (!r.ok) {
+                const body = await r.text();
+                throw new Error(`HTTP ${r.status}: ${body.slice(0, 120)}`);
+            }
+            json = await r.json();
+        } catch (e) {
+            errEl.textContent = `Ошибка: ${e.message}`;
+            statsEl.textContent = '—';
+            return;
+        }
+
+        layer.clearLayers();
+        const places = json.places || [];
+        for (const p of places) {
+            L.marker([p.lat, p.lng])
+                .bindPopup(popup(p), { maxWidth: 280 })
+                .addTo(layer);
+        }
+        statsEl.textContent = `${places.length} мест${json.hasMore ? ' (и ещё, перепиши limit)' : ''}`;
+    }
+
+    function buildFilters() {
+        for (const [key, label] of CATEGORIES) {
+            const b = document.createElement('button');
+            b.className = 'filter-btn' + (activeCategory === key ? ' active' : '');
+            b.textContent = label;
+            b.dataset.cat = key;
+            b.onclick = () => {
+                activeCategory = key;
+                document.querySelectorAll('.filter-btn').forEach(el =>
+                    el.classList.toggle('active', el.dataset.cat === key));
+                load();
+            };
+            filtersEl.appendChild(b);
+        }
+    }
+
+    buildFilters();
+    load();
+})();
+</script>
+</body>
+</html>

@@ -102,7 +102,7 @@ public class PlaceFilterParserTests
 
     [Theory]
     [InlineData("0")]
-    [InlineData("101")]
+    [InlineData("501")]
     [InlineData("-5")]
     [InlineData("notanumber")]
     public void Invalid_limit_fails(string limit)

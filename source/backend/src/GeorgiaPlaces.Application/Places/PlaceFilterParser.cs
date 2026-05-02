@@ -10,7 +10,9 @@ namespace GeorgiaPlaces.Application.Places;
 /// </summary>
 public static class PlaceFilterParser
 {
-    public const int MaxLimit = 100;
+    // 500 is enough to fully render Georgia at country zoom on a map view.
+    // Beyond that, clients use cursor pagination (TZ §8.0).
+    public const int MaxLimit = 500;
     public const int MaxAttrPairs = 10;
     public const int MaxCategories = 20;
 

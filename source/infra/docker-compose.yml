@@ -108,11 +108,31 @@ services:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
       - ./certs:/etc/nginx/certs:ro
+      - ../frontend:/usr/share/nginx/html:ro
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health"]
       interval: 15s
       timeout: 3s
       retries: 3
+    networks:
+      - gp-net
+
+  # Cloudflare Quick Tunnel — публичный *.trycloudflare.com URL без аккаунта.
+  # Профиль `tunnel` — стартует только явно (`docker compose --profile tunnel up -d`).
+  # URL ищем в логах: `docker compose --profile tunnel logs tunnel | grep trycloudflare.com`.
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: gp-tunnel
+    profiles: ["tunnel"]
+    restart: on-failure
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+    depends_on:
+      nginx:
+        condition: service_healthy
+    command: ["tunnel", "--no-autoupdate", "--url", "http://nginx:80"]
     networks:
       - gp-net
 
