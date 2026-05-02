@@ -72,14 +72,30 @@ TAG_TO_CATEGORY: dict[tuple[str, str], str] = {
     ("leisure", "water_park"):       "aquapark",
 }
 
-# Per-category Overpass queries — split to fit 256MB result limit.
-# Uses bbox filter; runs as a single Overpass call per category.
+# Per-tag Overpass queries — finer split than per-category.
+# `natural` previously was one regex with 5 values that 504-d on every
+# Overpass mirror; per-tag queries keep each result small and give us
+# partial success when one tag's dataset is overwhelmingly large.
 CATEGORIES_TO_FETCH: list[tuple[str, str]] = [
-    ("tourism", "viewpoint|museum|attraction|winery"),
-    ("historic", "monastery|castle|fort|ruins|church|memorial"),
-    ("natural", "peak|waterfall|cave_entrance|beach|hot_spring"),
-    ("leisure", "park|water_park"),
-    ("amenity", "restaurant|marketplace"),
+    ("tourism", "viewpoint"),
+    ("tourism", "museum"),
+    ("tourism", "attraction"),
+    ("tourism", "winery"),
+    ("historic", "monastery"),
+    ("historic", "castle"),
+    ("historic", "fort"),
+    ("historic", "ruins"),
+    ("historic", "church"),
+    ("historic", "memorial"),
+    ("natural", "peak"),
+    ("natural", "waterfall"),
+    ("natural", "cave_entrance"),
+    ("natural", "beach"),
+    ("natural", "hot_spring"),
+    ("leisure", "park"),
+    ("leisure", "water_park"),
+    ("amenity", "restaurant"),
+    ("amenity", "marketplace"),
 ]
 
 
@@ -95,25 +111,31 @@ class OsmPoi:
 
 
 # ── Overpass client ────────────────────────────────────────────────────
-def _build_query(key: str, values_regex: str) -> str:
+def _build_query(key: str, value: str) -> str:
     south, west, north, east = GEORGIA_BBOX
     bbox = f"{south},{west},{north},{east}"
+    # Single-value tag match — much cheaper for the server than a regex.
     return (
         f"[out:json][timeout:{OVERPASS_TIMEOUT_S}];"
         f"("
-        f"node[\"{key}\"~\"^({values_regex})$\"]({bbox});"
-        f"way[\"{key}\"~\"^({values_regex})$\"]({bbox});"
+        f"node[\"{key}\"=\"{value}\"]({bbox});"
+        f"way[\"{key}\"=\"{value}\"]({bbox});"
         f");"
         f"out center tags;"
     )
 
 
 def _fetch_overpass(query: str) -> dict | None:
-    """Try each endpoint until one returns a successful JSON response."""
+    """Try each endpoint until one returns a successful JSON response.
+
+    Sends as form-encoded `data=…` — what every Overpass UI does, and the
+    only encoding overpass-api.de's main mirror reliably accepts (text/plain
+    POSTs to it return 406).
+    """
     for endpoint in OVERPASS_ENDPOINTS:
         try:
             with httpx.Client(timeout=HTTP_TIMEOUT_S, follow_redirects=False) as client:
-                resp = client.post(endpoint, content=query, headers={"Content-Type": "text/plain"})
+                resp = client.post(endpoint, data={"data": query})
             if resp.status_code != 200:
                 log.warning("overpass.http_error", endpoint=endpoint, status=resp.status_code)
                 continue
@@ -267,15 +289,16 @@ def run() -> int:
     log.info("parser.start", bbox=GEORGIA_BBOX, categories=len(CATEGORIES_TO_FETCH))
 
     all_pois: list[OsmPoi] = []
-    for key, values in CATEGORIES_TO_FETCH:
-        query = _build_query(key, values)
-        log.info("overpass.query", key=key, values_regex=values)
+    for key, value in CATEGORIES_TO_FETCH:
+        query = _build_query(key, value)
+        log.info("overpass.query", key=key, value=value)
         payload = _fetch_overpass(query)
         if payload is None:
-            log.error("overpass.all_endpoints_failed", key=key)
+            log.error("overpass.all_endpoints_failed", key=key, value=value)
             continue
         category_pois = list(_iter_pois(payload))
-        log.info("overpass.parsed", key=key, raw=len(payload.get("elements", [])), kept=len(category_pois))
+        log.info("overpass.parsed", key=key, value=value,
+                 raw=len(payload.get("elements", [])), kept=len(category_pois))
         all_pois.extend(category_pois)
         time.sleep(SLEEP_BETWEEN_QUERIES_S)
 
